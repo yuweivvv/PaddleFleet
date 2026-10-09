@@ -57,6 +57,7 @@ from .grad_metrics import (
     GLOBAL_METRICS,
     MAX_AGGREGATED,
     METRICS,
+    SCALE_INVARIANT_AGGREGATED,
     TOKEN_METRICS,
     grad_square_and_stats,
 )
@@ -515,14 +516,20 @@ class PaddleGradHealthMonitor(PaddleProbe):
     # ------------------------------------------------------------------
 
     def finalize_scaled_grad_metrics(self, scaler=None) -> None:
-        """Divide this step's AMP loss scale out of every accumulator.
+        """Divide this step's AMP loss scale out of the degree-1 accumulators.
 
-        Every metric this monitor owns is degree-1 homogeneous in the gradient, so
-        one division fixes all of them -- and it is valid on the raw accumulator
-        because both aggregations commute with a positive scale: ``sum(g_i)/S`` is
-        the mean of ``g_i/S``, and ``max(g_i)/S`` is the max of ``g_i/S``. The
+        Most metrics this monitor owns are degree-1 homogeneous in the gradient,
+        so one division fixes them -- and it is valid on the raw accumulator
+        because both aggregations commute with a positive scale: ``sum(g_i)/S``
+        is the mean of ``g_i/S``, and ``max(g_i)/S`` is the max of ``g_i/S``. The
         scaler updates ``_scale`` in its own ``step``/``update``, i.e. once per
         optimizer step, so every microbatch folded into these sums shared it.
+
+        The ``token_*_ratio`` series in ``SCALE_INVARIANT_AGGREGATED`` are the
+        exception: a ratio (``max/median``) and the token fractions are degree-0,
+        so the scale already cancels and dividing again would shrink them by
+        ``S`` (order 1e4 under fp16), wiping out the token spike / drop-to-zero
+        signal they report. They are skipped here.
 
         Idempotent within a step: called from ``on_optimizer_begin`` when the
         trainer provides a scaler, with ``_flush_buffers`` as the fallback read
@@ -536,7 +543,10 @@ class PaddleGradHealthMonitor(PaddleProbe):
         scale = getattr(scaler, "_scale", None) if scaler is not None else None
         if scale is not None:
             scale = paddle.assign(scale).detach().astype("float32")
+            scale_invariant = tuple(SCALE_INVARIANT_AGGREGATED)
             for key in self._mean_keys | self._max_keys:
+                if key.endswith(scale_invariant):
+                    continue
                 if self._gpu_cnt.get(key, 0) > 0:
                     self._gpu_acc[key].divide_(scale)
         self._grad_metrics_finalized = True

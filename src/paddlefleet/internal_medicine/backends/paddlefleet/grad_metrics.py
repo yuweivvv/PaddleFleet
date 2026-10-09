@@ -97,6 +97,24 @@ MAX_AGGREGATED = frozenset(
     f"{position}_{metric}" for position in POSITIONS for metric in MAX_METRICS
 )
 
+# Degree-0 (scale-invariant) metrics. ``token_norm_ratio`` is ``max / median``
+# and the other two are token fractions, so a positive AMP loss scale cancels
+# in them -- they are the exception to the degree-1 homogeneity the rest of this
+# monitor relies on. ``finalize_scaled_grad_metrics`` must NOT divide the scale
+# out of these: doing so would shrink them by the scale (order 1e4 under fp16)
+# and wipe out exactly the token spike / drop-to-zero signal they exist to catch.
+SCALE_INVARIANT_METRICS = (
+    "token_norm_ratio",
+    "token_outlier_ratio",
+    "token_zero_ratio",
+)
+
+SCALE_INVARIANT_AGGREGATED = frozenset(
+    f"{position}_{metric}"
+    for position in POSITIONS
+    for metric in SCALE_INVARIANT_METRICS
+)
+
 
 def grad_token_stats(value: paddle.Tensor) -> dict[str, paddle.Tensor]:
     """Per-token gradient-vector statistics of an already-fp32 tensor.

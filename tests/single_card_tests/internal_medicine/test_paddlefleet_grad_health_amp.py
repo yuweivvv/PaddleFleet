@@ -44,6 +44,7 @@ training_logs = importlib.import_module(
 
 FakeLayer = _fixtures.FakeLayer
 WIDTH = _fixtures.WIDTH
+grad_metrics = _fixtures.grad_metrics
 SCALE = 8.0
 
 
@@ -90,6 +91,67 @@ class GradHealthAmpTest(unittest.TestCase):
     def test_a_run_without_a_scaler_is_left_alone(self):
         """Non-AMP runs and direct users must not have their values touched."""
         self.assertAlmostEqual(self._run(0), self._raw_norm(), places=4)
+
+
+class GradHealthScaleInvariantTest(unittest.TestCase):
+    """``token_*_ratio`` are degree-0, so the loss scale must not reach them.
+
+    The norm / rms / abs_max siblings are degree-1 and get the scale divided out
+    (covered above). These three are a ratio and two token fractions where the
+    scale cancels, so dividing again would shrink them by ``_scale`` and bury the
+    spike / drop-to-zero signal. Regression test for the de-scale loop skipping
+    ``SCALE_INVARIANT_AGGREGATED``.
+    """
+
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def _latest_after(self, scale, seed):
+        layers = [FakeLayer(0)]
+        monitor = _fixtures._monitor(layers, log_global=False)
+        _fixtures._run_backward(layers, seed)
+        scaler = (
+            None
+            if scale is None
+            else SimpleNamespace(_scale=paddle.to_tensor(scale))
+        )
+        monitor.finalize_scaled_grad_metrics(scaler)
+        monitor.step()
+        return training_logs.get_latest(prefix="grad_health")
+
+    def test_token_ratios_do_not_move_with_the_scale(self):
+        # layer_out's gradient is exactly the seed; two tokens of norm 4 and 1
+        # give token_norm_ratio > 1. Degree-0, so AMP and non-AMP must agree.
+        seed = paddle.to_tensor([[4.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+        raw = self._latest_after(None, seed)
+        scaled = self._latest_after(SCALE, seed)
+        for metric in grad_metrics.SCALE_INVARIANT_METRICS:
+            key = f"grad_health/layer_0/layer_out_{metric}"
+            self.assertAlmostEqual(
+                scaled[key],
+                raw[key],
+                places=4,
+                msg=f"{metric} was altered by the loss scale",
+            )
+        # Guard the discriminating case explicitly: the ratio must stay > 1, not
+        # be the ~1/SCALE a stray division would leave behind.
+        self.assertGreater(
+            scaled["grad_health/layer_0/layer_out_token_norm_ratio"], 1.0
+        )
+
+    def test_token_zero_ratio_survives_a_large_scale(self):
+        # One live token, one dead -> token_zero_ratio = 0.5. Without the skip it
+        # would be divided down to 0.0625 under _scale=8.
+        seed = paddle.to_tensor([[4.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+        scaled = self._latest_after(SCALE, seed)
+        self.assertAlmostEqual(
+            scaled["grad_health/layer_0/layer_out_token_zero_ratio"],
+            0.5,
+            places=4,
+        )
 
 
 if __name__ == "__main__":
